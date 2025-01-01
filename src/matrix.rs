@@ -1,11 +1,12 @@
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
 use std::iter::zip;
 use std::ops::RangeInclusive;
 
 /// A simple 2D array type.
-#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Matrix {
     pub nrows: usize,
     pub ncols: usize,
@@ -13,7 +14,7 @@ pub struct Matrix {
 }
 
 /// A simple 1D array type.
-#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Vector {
     pub len: usize,
     pub data: Vec<u64>,
@@ -166,6 +167,16 @@ impl Matrix {
     pub fn row_unchecked(&self, row_index: usize) -> Vec<u64> {
         unsafe { self.data.get_unchecked(row_index).clone() }
     }
+
+    /// Serializes the matrix to a JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Deserializes a matrix from a JSON string.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
 }
 
 impl Vector {
@@ -262,6 +273,16 @@ impl Vector {
     // Sums up all the elements in the vector.
     pub fn sum(&self) -> u64 {
         self.data.iter().sum()
+    }
+
+    /// Serializes the vector to a JSON string.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    /// Deserializes a vector from a JSON string.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
     }
 }
 
@@ -427,4 +448,57 @@ pub fn packed_mat_vec_mul(vector: &Vector, packed_matrix: &Matrix, mod_power: u3
         result[row_index] = row_sum;
     }
     Vector::from_vec(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matrix_serialization() {
+        let matrix = Matrix::from_data(vec![
+            vec![1, 2, 3],
+            vec![4, 5, 6],
+            vec![7, 8, 9],
+        ]);
+
+        // Test serialization
+        let json = matrix.to_json().unwrap();
+        
+        // Test deserialization
+        let deserialized = Matrix::from_json(&json).unwrap();
+        
+        assert_eq!(matrix, deserialized);
+        assert_eq!(matrix.nrows, deserialized.nrows);
+        assert_eq!(matrix.ncols, deserialized.ncols);
+        assert_eq!(matrix.data, deserialized.data);
+    }
+
+    #[test]
+    fn test_vector_serialization() {
+        let vector = Vector::from_vec(vec![1, 2, 3, 4, 5]);
+
+        // Test serialization
+        let json = vector.to_json().unwrap();
+        
+        // Test deserialization
+        let deserialized = Vector::from_json(&json).unwrap();
+        
+        assert_eq!(vector, deserialized);
+        assert_eq!(vector.len, deserialized.len);
+        assert_eq!(vector.data, deserialized.data);
+    }
+
+    #[test]
+    fn test_large_matrix_serialization() {
+        let matrix = Matrix::new_random(100, 100, 0..=1000, Some(42));
+
+        // Test serialization
+        let json = matrix.to_json().unwrap();
+        
+        // Test deserialization
+        let deserialized = Matrix::from_json(&json).unwrap();
+        
+        assert_eq!(matrix, deserialized);
+    }
 }
