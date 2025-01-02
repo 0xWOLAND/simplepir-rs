@@ -104,13 +104,13 @@
 //! ```
 
 mod matrix;
-mod regev;
+pub mod regev;
 use matrix::{a_matrix_mul_db, mat_vec_mul, packed_mat_vec_mul};
 pub use matrix::{Matrix, Vector};
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_distr::Uniform;
-use regev::{encrypt, gen_a_matrix, gen_secret_key};
+pub use regev::{encrypt, gen_a_matrix, gen_secret_key};
 use thiserror::Error;
 
 /// A square matrix that contains `u64` data records.
