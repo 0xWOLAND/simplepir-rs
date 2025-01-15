@@ -1,651 +1,220 @@
-//! A fast and efficient implementation of SimplePIR in Rust.
-//!
-//! # Background
-//! [Private information retrieval](https://en.wikipedia.org/wiki/Private_information_retrieval)
-//! (PIR) is a protocol for accessing information from a database hosted on a server without the
-//! server knowing anything about the information that was accessed, including the index of the
-//! information within the database. SimplePIR is a fast and efficient implementation of PIR that
-//! provides square-root communication costs and linear computation costs. To learn more about
-//! SimplePIR, check out [this paper](https://eprint.iacr.org/2022/949) by Alexandra Henzinger,
-//! Matthew M. Hong, Henry Corrigan-Gibbs, Sarah Meiklejohn, and Vinod Vaikuntanathan.
-//!
-//! # Getting Started
-//! We'll start by specifying some basic parameters for the SimplePIR scheme. For
-//! good security and performance, a secret-key dimension (the length of the
-//! encryption key) of 2,048 is recommended. We'll also specify the plaintext
-//! modulus, which tells us the range of numbers that can be accurately accessed
-//! and decrypted. In this example, we'll use 2^17.
-//! ```
-//! use simplepir::{Matrix, Database};
-//! let secret_dimension = 2048;
-//! let mod_power = 17;
-//! let plaintext_mod = 2_u64.pow(mod_power);
-//! ```
-//! We'll then create a simple database to store our data. Databases can be created
-//! at random or from an existing Matrix. This crate provides basic [Matrix] and [Vector] types for
-//! convenience.
-//! ```
-//! let matrix = Matrix::from_data(
-//!     vec![
-//!         vec![1, 2, 3, 4],
-//!         vec![5, 6, 7, 8],
-//!         vec![9, 10, 11, 12],
-//!         vec![13, 14, 15, 16],
-//!     ]
-//! );
-//! let db = Database::from_matrix(matrix, mod_power);
-//! ```
-//! To increase performance while also decreasing memory consumption, the database can be
-//! compressed by packing three data records (numbers) into a single record.
-//! ```
-//! let compressed_db = db.compress();
-//! ```
-//!
-//! Now for the fun parts! There are four main functions of the SimplePIR protocol:
-//!
-//! ### Offline Phase
-//!
-//! ## [`setup()`]
-//! Takes the database as input and outputs a hint for the client and for the
-//! server. This is called by the **server** separately and prior to the other functions. It's very
-//! computationally heavy, but massively speeds up the "online" portion of the protocol.
-//!
-//! ```
-//! let (server_hint, client_hint) = setup(&compressed_db, secret_dimension);
-//! ```
-//!
-//! ### Online Phase
-//!
-//! ## [`query()`]
-//! Takes an index into the database and outputs an encrypted query. This is called
-//! by the **client**.
-//!
-//! ```
-//! let index = 0;
-//! let (client_state, query_cipher) = query(index, 4, secret_dimension, server_hint,
-//! plaintext_mod);
-//!
-//! ```
-//! The `client_state` variable just stores some basic information about the
-//! client's query.
-//!
-//! ## [`answer()`]
-//! Takes the matrix-vector product between the encrypted query and the entire database and outputs
-//! an encrypted answer vector. This is called by the **server** and is the most computationally
-//! intense part of the online phase.
-//!
-//! ```
-//! let answer_cipher = answer(&compressed_db, &query_cipher);
-//! ```
-//!
-//! ## [`recover()`]
-//! Takes the encrypted answer vector, decrypts it, and returns the desired record.
-//!
-//! ```
-//! let record = recover(&client_state, &client_hint, &answer_cipher, &query_cipher, plaintext_mod);
-//! ```
-//!
-//! ## [`recover_row()`]
-//! Takes the encrypted answer vector and decrypts it to return an entire row of records. This is more
-//! efficient than calling [`recover()`] multiple times when you need all records in a row.
-//!
-//! ```
-//! let row = recover_row(&client_state, &client_hint, &answer_cipher, &query_cipher, plaintext_mod);
-//! // Access individual records in the row
-//! for col in 0..db_side_len {
-//!     let record = row.get_unchecked(col);
-//!     // Use the record...
-//! }
-//! ```
-//!
-//! Now if we did everything right, this assert shouldn't fail!
-//! ```
-//! assert_eq!(database.get(index).unwrap(), record);
-//! ```
-
-mod matrix;
-pub mod regev;
-use matrix::{a_matrix_mul_db, mat_vec_mul, packed_mat_vec_mul};
-pub use matrix::{Matrix, Vector};
-use rand::prelude::*;
+use nalgebra::{DMatrix, DVector};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use rand_distr::Uniform;
-pub use regev::{encrypt, gen_a_matrix, gen_secret_key};
-use thiserror::Error;
+use rand_distr::{Distribution, Normal};
 
-/// A square matrix that contains `u64` data records.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd)]
-pub struct Database {
-    pub data: Matrix,
-    pub modulus: u64,
+#[derive(Debug, Clone)]
+pub struct SimplePIRParams {
+    n: usize,       // LWE dimension
+    m: usize,       // Matrix dimension
+    q: u64,         // LWE modulus
+    p: u64,         // Plaintext modulus
+    std_dev: f64,   // Standard deviation for error
+    seed: u64,      // Random seed for reproducibility
 }
 
-/// An error type for database creation errors.
-#[derive(Error, Debug)]
-pub enum DatabaseError {
-    /// An error resulting from the number of rows and columns in an inputted matrix not being
-    /// equal.
-    #[error("The number of rows and columns in the matrix must be equal")]
-    NonSquareMatrixError,
-    /// An error resulting from the modulus of the database being too large to sucessfully pack
-    /// 3 records into 1.
-    #[error("The modulus of the database must be less than 21")]
-    CompressionModulusError,
+pub fn gen_params(m: usize, n: usize, mod_power: u32) -> SimplePIRParams {
+    let mut rng = rand::thread_rng();
+    SimplePIRParams {
+        n,
+        m,
+        q: u64::MAX,  // 2^64 - 1
+        p: 1u64 << mod_power,
+        std_dev: 3.2,
+        seed: rng.gen(),
+    }
 }
 
-impl Database {
-    /// Creates a new Database from an existing square Matrix. If the supplied modulus is greater
-    /// than 2^32, it will be reduced to 2^32.
-    pub fn from_matrix(data: Matrix, mod_power: u8) -> Result<Database, DatabaseError> {
-        let mod_power = if mod_power > 32 { 32 } else { mod_power };
-        if data.nrows() != data.ncols() {
-            return Err(DatabaseError::NonSquareMatrixError);
-        }
-        let modulus = 2_u64.pow(mod_power as u32);
-        Ok(Database { data, modulus })
-    }
-    /// Creates a new Database of size `side_len` × `side_len` populated by random data. The data is
-    /// sampled from a uniform distribution over the range from 0 to the plaintext modulus
-    /// (`0..2^mod_power`). The plaintext modulus cannot be greater than 2^32. If the supplied
-    /// modulus is larger, it will be reduced to 2^32.
-    pub fn new_random(side_len: usize, mod_power: u8) -> Database {
-        let mod_power = if mod_power > 32 { 32 } else { mod_power };
-        let modulus = 2_u64.pow(mod_power as u32);
-        let range = 0..=modulus - 1;
-
-        Database {
-            data: Matrix::new_random(side_len, side_len, range, None),
-            modulus,
-        }
-    }
-    /// Creates a new Database of size `side_len`×`side_len` populated by random data generated
-    /// using a seed. The data is sampled from a uniform distribution over the range from 0 to the
-    /// plaintext modulus (`0..2^mod_power`). The plaintext modulus cannot be greater than 2^32. If
-    /// the supplied modulus is larger, it will be reduced to 2^32.
-    pub fn new_random_seed(side_len: usize, mod_power: u8, seed: u64) -> Database {
-        let mod_power = if mod_power > 32 { 32 } else { mod_power };
-        let modulus = 2_u64.pow(mod_power as u32);
-        let range = 0..=modulus - 1;
-        Database {
-            data: Matrix::new_random(side_len, side_len, range, Some(seed)),
-            modulus,
-        }
-    }
-    /// Creates a new Database from a `Vec<u64>` of data and resizes it into a square matrix. Panics
-    /// if the number of entries cannot be evenly resized into a square matrix. If the plaintext
-    /// modulus is greater than 2^32, the modulus is reduced to 2^32.
-    pub fn from_vector(data: Vec<u64>, mod_power: u8) -> Database {
-        let mod_power = if mod_power > 32 { 32 } else { mod_power };
-        let modulus = 2_u64.pow(mod_power as u32);
-        let db_side_len = (data.len() as f32).sqrt().ceil() as usize;
-        Database {
-            data: Matrix::from_vec(data, db_side_len, db_side_len),
-            modulus,
-        }
-    }
-    /// Creates a new Database populated entirely by zeros. An optional modulus can be provided,
-    /// however if it's larger than 2^32, the modulus is reduced to 2^32.
-    pub fn zeros(side_len: usize, mod_power: Option<u8>) -> Database {
-        let mod_power = if let Some(num) = mod_power { num } else { 1 };
-        let mod_power = if mod_power > 32 { 32 } else { mod_power };
-        let modulus = 2_u64.pow(mod_power as u32);
-        Database {
-            data: Matrix::zeros(side_len, side_len),
-            modulus,
-        }
-    }
-
-    /// Gets the length of one side of the square Matrix within the Database.
-    pub fn side_len(&self) -> usize {
-        self.data.nrows()
-    }
-
-    /// Get a record at an index. The index is as if the square Matrix was resized into a vector
-    /// according to row-major order.
-    pub fn get(&self, index: usize) -> Option<u64> {
-        let row_index = index / self.data.nrows();
-        let col_index = index % self.data.ncols();
-        self.data.get(row_index, col_index)
-    }
-
-    /// Compresses the database by packing three records into one 64-bit integer. The compression takes
-    /// place along each row, meaning there'll be one third the number of columns in the new
-    /// database compared to the old one.
-    pub fn compress(&self) -> Result<CompressedDatabase, DatabaseError> {
-        // let mod_power = (self.modulus as f32).log2().ceil() as u32;
-        if self.modulus > 2_u64.pow(21) {
-            return Err(DatabaseError::CompressionModulusError);
-        }
-
-        let mod_power = self.modulus.ilog2();
-        let mask = self.modulus - 1;
-        let data: Vec<u64> = self
-            .data
-            .data
-            .iter()
-            .map(move |row| {
-                (0..row.len().div_ceil(3)).map(move |i| {
-                    row.get(i * 3).unwrap_or(&0) & mask
-                        | (row.get(i * 3 + 1).unwrap_or(&0) & mask) << mod_power
-                        | (row.get(i * 3 + 2).unwrap_or(&0) & mask) << (mod_power * 2)
-                })
-            })
-            .flatten()
-            .collect();
-        Ok(CompressedDatabase {
-            data: Matrix::from_vec(data, self.data.nrows(), self.data.ncols().div_ceil(3)),
-            nrows: self.data.nrows(),
-            ncols: self.data.ncols().div_ceil(3),
-            mod_power,
+pub fn gen_matrix_a(seed: u64, m: usize, n: usize, q: u64) -> DMatrix<u64> {
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let data: Vec<u64> = (0..m * n)
+        .map(|_| {
+            let a = rng.gen::<u32>() as u64;
+            let b = rng.gen::<u32>() as u64;
+            ((a as u128 * b as u128) % q as u128) as u64
         })
-    }
+        .collect();
+    DMatrix::from_vec(m, n, data)
 }
 
-/// A compressed version of a regular Database with 3 records packed into one.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd)]
-pub struct CompressedDatabase {
-    data: Matrix,
-    nrows: usize,
-    ncols: usize,
-    mod_power: u32,
+pub fn gen_secret(q: u64, n: usize, seed: Option<u64>) -> DVector<u64> {
+    let mut rng = match seed {
+        Some(s) => ChaCha20Rng::seed_from_u64(s),
+        None => ChaCha20Rng::from_entropy(),
+    };
+    
+    let data: Vec<u64> = (0..n)
+        .map(|_| {
+            let a = rng.gen::<u32>() as u64;
+            let b = rng.gen::<u32>() as u64;
+            ((a as u128 * b as u128) % q as u128) as u64
+        })
+        .collect();
+    DVector::from_vec(data)
 }
 
-/// A struct that contains information about the client's query, including the row and column index,
-/// the a-matrix of the database, the side length of the database, the client's secret key, and the
-/// key's length.
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd)]
-pub struct ClientState {
-    row_index: usize,
-    column_index: usize,
-    a_matrix_seed: u64,
-    db_side_len: usize,
-    secret_key: Vector,
-    secret_dimension: usize,
+// Helper function for safe modular multiplication
+fn safe_mod_mul(a: u64, b: u64, q: u64) -> u64 {
+    ((a as u128 * b as u128) % q as u128) as u64
 }
 
-impl ClientState {
-    fn new(
-        row_index: usize,
-        column_index: usize,
-        a_matrix_seed: u64,
-        db_side_len: usize,
-        secret_key: &Vector,
-    ) -> ClientState {
-        ClientState {
-            row_index,
-            column_index,
-            a_matrix_seed,
-            db_side_len,
-            secret_key: secret_key.clone(),
-            secret_dimension: secret_key.len(),
+// Helper function for safe modular addition
+fn safe_mod_add(a: u64, b: u64, q: u64) -> u64 {
+    let sum = a as u128 + b as u128;
+    (sum % q as u128) as u64
+}
+
+pub fn gen_hint(params: &SimplePIRParams, db: &DMatrix<u64>) -> (DMatrix<u64>, DMatrix<u64>) {
+    let a = gen_matrix_a(params.seed, params.m, params.n, params.q);
+    
+    // Matrix multiplication with modulo
+    let mut hint = DMatrix::zeros(db.nrows(), a.ncols());
+    for i in 0..db.nrows() {
+        for j in 0..a.ncols() {
+            let mut sum = 0u64;
+            for k in 0..db.ncols() {
+                sum = safe_mod_add(sum, safe_mod_mul(db[(i, k)], a[(k, j)], params.q), params.q);
+            }
+            hint[(i, j)] = sum;
         }
     }
+    
+    (hint, a)
 }
 
-/// Outputs one hint for the server and one hint for the client. The server hint is the seed to
-/// generate the a-matrix for the query, which since it stays constant, can be generated ahead of
-/// time. The server hint is generated at random. The client hint is the matrix multiplication of this a-matrix with the data in the
-/// database. This also stays constant and can be generated ahead of time to save on computation.
-pub fn setup(database: &Database, secret_dimension: usize) -> (u64, Matrix) {
-    let mut rng = ChaCha20Rng::from_entropy();
-    let server_hint = Uniform::from(0..=u64::MAX).sample(&mut rng);
-    let data = database.data.add_scalar(u64::MAX * (database.modulus / 2));
-    let a_matrix = gen_a_matrix(database.side_len(), secret_dimension, Some(server_hint));
-    let client_hint = a_matrix_mul_db(&a_matrix, &data);
-    (server_hint, client_hint)
-}
-
-/// Outputs one hint for the server and one hint for the client. The server hint is the seed to
-/// generate the a-matrix for the query, which since it stays constant, can be generated ahead of
-/// time. The server hint is generated at random according to a specified seed. The client hint is the matrix multiplication of this a-matrix with the data in the
-/// database. This also stays constant and can be generated ahead of time to save on computation.
-pub fn setup_seeded(database: &Database, secret_dimension: usize, seed: [u8; 32]) -> (u64, Matrix) {
-    let mut rng = ChaCha20Rng::from_seed(seed);
-    let server_hint = Uniform::from(0..=u64::MAX).sample(&mut rng);
-    let data = database.data.add_scalar(u64::MAX * (database.modulus / 2));
-    let a_matrix = gen_a_matrix(database.side_len(), secret_dimension, Some(server_hint));
-    let client_hint = a_matrix_mul_db(&a_matrix, &data);
-    (server_hint, client_hint)
-}
-/// Takes an index in the length-N database and outputs an encrypted vector with all 0s except for
-/// a 1 at the column index.
-pub fn query(
-    index: usize,
-    db_side_len: usize,
-    secret_dimension: usize,
-    a_matrix_seed: u64,
-    plain_mod: u64,
-) -> (ClientState, Vector) {
-    let secret_key = gen_secret_key(secret_dimension, None);
-    let a_matrix = gen_a_matrix(db_side_len, secret_dimension, Some(a_matrix_seed));
-    let row_index = index % db_side_len;
-    let column_index = index / db_side_len;
-    let mut query_vector = Vector::zeros(db_side_len);
-    query_vector.data[row_index] = 1;
-    let client_state = ClientState::new(
-        row_index,
-        column_index,
-        a_matrix_seed,
-        db_side_len,
-        &secret_key,
+pub fn encrypt(params: &SimplePIRParams, v: &DVector<u64>, a: &DMatrix<u64>, s: &DVector<u64>) -> DVector<u64> {
+    let delta = params.q / params.p;
+    
+    // Generate Gaussian error
+    let normal = Normal::new(0.0, params.std_dev).unwrap();
+    let mut rng = rand::thread_rng();
+    let e: DVector<u64> = DVector::from_iterator(
+        params.m,
+        (0..params.m).map(|_| {
+            let err = (normal.sample(&mut rng) * params.p as f64).round();
+            let err_mod = ((err % params.q as f64) + params.q as f64) % params.q as f64;
+            err_mod as u64
+        })
     );
-    (
-        client_state,
-        encrypt(&secret_key, &a_matrix, &query_vector, plain_mod).1,
-    )
-}
-
-/// Computes the matrix-vector product of the **packed** database and the encrypted query. The output is an
-/// encrypted vector that can be decrypted to reveal the records along the column indicated in the
-/// query.
-pub fn answer(database: &CompressedDatabase, query_cipher: &Vector) -> Vector {
-    packed_mat_vec_mul(&query_cipher, &database.data, database.mod_power)
-}
-/// Computes the matrix-vector product of the **non-packed** database and the encrypted query. The
-/// output is an encrypted vector that can be decrypted to reveal the records along the column
-/// indicated in the query.
-pub fn answer_uncompressed(database: &Database, query_cipher: &Vector) -> Vector {
-    mat_vec_mul(&query_cipher, &database.data)
-}
-
-/// Takes the encrypted vector of records along the column specified in the query, decrypts it using
-/// the secret key, and returns the record at the row and column that was specified in the query.
-pub fn recover(
-    client_state: &ClientState,
-    client_hint: &Matrix,
-    answer_cipher: &Vector,
-    query_cipher: &Vector,
-    plaintext_mod: u64,
-) -> u64 {
-    let ciphertext_mod = 2u128.pow(64);
-    let q_over_p = (ciphertext_mod / plaintext_mod as u128) as u64;
-
-    let secret_key = &client_state.secret_key;
-    let column_index = client_state.column_index;
-
-    let ratio = plaintext_mod / 2;
-    let noised = answer_cipher.get_unchecked(column_index)
-        - ratio * query_cipher.sum()
-        - Vector::from_vec(client_hint.row_unchecked(column_index)).dot(secret_key);
-    let denoised = (noised + q_over_p / 2) / q_over_p;
-
-    (denoised - ratio).rem_euclid(plaintext_mod)
-}
-
-/// Takes the encrypted vector of records along the column specified in the query, decrypts it using
-/// the secret key, and returns a vector containing all records in the row.
-pub fn recover_row(
-    client_state: &ClientState,
-    client_hint: &Matrix,
-    answer_cipher: &Vector,
-    query_cipher: &Vector,
-    plaintext_mod: u64,
-) -> Vector {
-    let ciphertext_mod = 2u128.pow(64);
-    let q_over_p = (ciphertext_mod / plaintext_mod as u128) as u64;
-    let secret_key = &client_state.secret_key;
-    let ratio = plaintext_mod / 2;
-    let db_side_len = client_state.db_side_len;
-
-    let mut records = Vec::with_capacity(db_side_len);
-    for i in 0..db_side_len {
-        let noised = answer_cipher.get_unchecked(i)
-            - ratio * query_cipher.sum()
-            - Vector::from_vec(client_hint.row_unchecked(i)).dot(secret_key);
-        let denoised = (noised + q_over_p / 2) / q_over_p;
-        records.push((denoised - ratio).rem_euclid(plaintext_mod));
+    
+    // Compute As
+    let mut as_prod = DVector::zeros(params.m);
+    for i in 0..params.m {
+        let mut sum = 0u64;
+        for j in 0..params.n {
+            sum = safe_mod_add(sum, safe_mod_mul(a[(i, j)], s[j], params.q), params.q);
+        }
+        as_prod[i] = sum;
     }
-    Vector::from_vec(records)
+    
+    // Compute final result with modular arithmetic
+    let mut result = DVector::zeros(params.m);
+    for i in 0..params.m {
+        let mut sum = as_prod[i];
+        sum = safe_mod_add(sum, e[i], params.q);
+        sum = safe_mod_add(sum, safe_mod_mul(delta, v[i], params.q), params.q);
+        result[i] = sum;
+    }
+    
+    result
+}
+
+pub fn generate_query(params: &SimplePIRParams, v: &DVector<u64>, a: &DMatrix<u64>) -> (DVector<u64>, DVector<u64>) {
+    assert_eq!(v.len(), params.m, "Vector dimension mismatch");
+    
+    let s = gen_secret(params.q, params.n, None);
+    let query = encrypt(params, v, a, &s);
+    
+    (s, query)
+}
+
+pub fn process_query(db: &DMatrix<u64>, query: &DVector<u64>, q: u64) -> DVector<u64> {
+    let mut result = DVector::zeros(db.nrows());
+    for i in 0..db.nrows() {
+        let mut sum = 0u64;
+        for j in 0..db.ncols() {
+            sum = safe_mod_add(sum, safe_mod_mul(db[(i, j)], query[j], q), q);
+        }
+        result[i] = sum;
+    }
+    result
+}
+
+pub fn recover(hint: &DMatrix<u64>, s: &DVector<u64>, answer: &DVector<u64>, params: &SimplePIRParams) -> DVector<u64> {
+    let delta = params.q / params.p;
+    
+    // Compute hint * s with modulo
+    let mut hint_s = DVector::zeros(answer.len());
+    for i in 0..answer.len() {
+        let mut sum = 0u64;
+        for j in 0..s.len() {
+            sum = safe_mod_add(sum, safe_mod_mul(hint[(i, j)], s[j], params.q), params.q);
+        }
+        hint_s[i] = sum;
+    }
+    
+    // Compute decrypted = answer - hint*s mod q
+    let mut decrypted = DVector::zeros(answer.len());
+    for i in 0..answer.len() {
+        let diff = if answer[i] >= hint_s[i] {
+            answer[i] - hint_s[i]
+        } else {
+            params.q - (hint_s[i] - answer[i])
+        };
+        decrypted[i] = diff % params.q;
+    }
+    
+    // Round to nearest multiple of delta and scale down
+    decrypted.map(|x| {
+        let rounded = ((x as f64 / delta as f64).round() as u64) % params.p;
+        rounded
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
-    fn test1() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 2048;
-        let db_side_len = 40;
-        let mod_power = 3;
-        let plain_mod = 2_u64.pow(mod_power as u32);
-        let index = 0;
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        let compressed_db = database.compress().unwrap();
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-        let (client_state, query_cipher) =
-            query(index, db_side_len, secret_dimension, server_hint, plain_mod);
-        let answer_cipher = answer(&compressed_db, &query_cipher);
-        let record = recover(
-            &client_state,
-            &client_hint,
-            &answer_cipher,
-            &query_cipher,
-            plain_mod,
-        );
-        assert_eq!(record, database.get(index).unwrap())
-    }
-
-    #[test]
-    fn test2() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 2048;
-        let db_side_len = 1000;
-        let mod_power = 17;
-        let plain_mod = 2u64.pow(mod_power as u32);
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        let compressed_database = database.compress().unwrap();
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-        for index in 0..100 {
-            let (client_state, query_cipher) =
-                query(index, db_side_len, secret_dimension, server_hint, plain_mod);
-            let answer_cipher = answer(&compressed_database, &query_cipher);
-            let record = recover(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-            assert_eq!(record, database.get(index).unwrap())
-        }
-    }
-
-    #[test]
-    fn test3() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-        let secret_dimension = 10;
-        let db_side_len = 1000;
-        let mod_power = 3;
-        let plain_mod = 2u64.pow(mod_power as u32);
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        println!("Database Modulus: {}", database.modulus);
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-        for index in 0..100 {
-            let (client_state, query_cipher) =
-                query(index, db_side_len, secret_dimension, server_hint, plain_mod);
-            let answer_cipher = answer_uncompressed(&database, &query_cipher);
-            let record = recover(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-            assert_eq!(record, database.get(index).unwrap())
-        }
-    }
-
-    #[test]
-    fn test4() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 1000;
-        let db_side_len = 38;
-        let mod_power = 17;
-        let plain_mod = 2u64.pow(mod_power as u32);
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        let database_compressed = database.compress().unwrap();
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-        for index in 0..1444 {
-            let (client_state, query_cipher) =
-                query(index, db_side_len, secret_dimension, server_hint, plain_mod);
-            let answer_cipher = answer(&database_compressed, &query_cipher);
-            let record = recover(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-            assert_eq!(record, database.get(index).unwrap())
-        }
-    }
-
-    #[test]
-    fn test_recover_row_basic() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 2048;
-        let db_side_len = 40;
-        let mod_power = 3;
-        let plain_mod = 2_u64.pow(mod_power as u32);
-
-        let test_rows = vec![0, 1, 5, db_side_len/2, db_side_len-2, db_side_len-1];
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
+    fn test_pir() {
+        let matrix_height = 10;
+        let matrix_width = 10;
+        let max_val = (1u64 << 17) - 1;
         
-        let compressed_db = database.compress().unwrap();
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-
-        for &row_index in test_rows.iter() {
-            let index = row_index;
-            let (client_state, query_cipher) =
-                query(index, db_side_len, secret_dimension, server_hint, plain_mod);
-            
-            let answer_cipher = answer(&compressed_db, &query_cipher);
-            let recovered_row = recover_row(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-
-            let answer_cipher_uncompressed = answer_uncompressed(&database, &query_cipher);
-            let recovered_row_uncompressed = recover_row(
-                &client_state,
-                &client_hint,
-                &answer_cipher_uncompressed,
-                &query_cipher,
-                plain_mod,
-            );
-
-            for col in 0..db_side_len {
-                let index = row_index + col * db_side_len;
-                let expected = database.get(index).unwrap();
-                assert_eq!(recovered_row.get_unchecked(col), expected, 
-                    "Compressed DB: Mismatch at row {}, col {}", row_index, col);
-                assert_eq!(recovered_row_uncompressed.get_unchecked(col), expected,
-                    "Uncompressed DB: Mismatch at row {}, col {}", row_index, col);
-            }
-        }
-    }
-
-    #[test]
-    fn test_recover_row_large() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 2048;
-        let db_side_len = 100;
-        let mod_power = 17;
-        let plain_mod = 2_u64.pow(mod_power as u32);
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        let compressed_db = database.compress().unwrap();
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-
-        let mut rng = ChaCha20Rng::from_seed(SEED);
-        let test_rows: Vec<usize> = (0..10)
-            .map(|_| rng.gen_range(0..db_side_len))
+        // Create random test data
+        let mut rng = rand::thread_rng();
+        let d_data: Vec<u64> = (0..matrix_height * matrix_width)
+            .map(|_| rng.gen_range(0..=max_val))
             .collect();
-
-        for &row_index in test_rows.iter() {
-            let (client_state, query_cipher) =
-                query(row_index, db_side_len, secret_dimension, server_hint, plain_mod);
-            let answer_cipher = answer(&compressed_db, &query_cipher);
-            let recovered_row = recover_row(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-
-            for col in 0..db_side_len {
-                let index = row_index + col * db_side_len;
-                assert_eq!(recovered_row.get_unchecked(col), database.get(index).unwrap(),
-                    "Large DB: Mismatch at row {}, col {}", row_index, col);
+        let d = DMatrix::from_vec(matrix_height, matrix_width, d_data);
+        
+        let v_data: Vec<u64> = (0..matrix_width)
+            .map(|_| rng.gen_range(0..=max_val))
+            .collect();
+        let v = DVector::from_vec(v_data);
+        
+        // Expected result
+        let expected = {
+            let mut result = DVector::zeros(matrix_height);
+            for i in 0..matrix_height {
+                let mut sum = 0u64;
+                for j in 0..matrix_width {
+                    sum = (sum + d[(i, j)] * v[j]) % (1u64 << 17);
+                }
+                result[i] = sum;
             }
-        }
-    }
-
-    #[test]
-    fn test_recover_row_small() {
-        const SEED: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let secret_dimension = 10;
-        let db_side_len = 4;
-        let mod_power = 2;
-        let plain_mod = 2_u64.pow(mod_power as u32);
-
-        let database = Database::new_random_seed(db_side_len, mod_power, 42);
-        let (server_hint, client_hint) = setup_seeded(&database, secret_dimension, SEED);
-
-        for row_index in 0..db_side_len {
-            let (client_state, query_cipher) =
-                query(row_index, db_side_len, secret_dimension, server_hint, plain_mod);
-            let answer_cipher = answer_uncompressed(&database, &query_cipher);
-            let recovered_row = recover_row(
-                &client_state,
-                &client_hint,
-                &answer_cipher,
-                &query_cipher,
-                plain_mod,
-            );
-
-            for col in 0..db_side_len {
-                let index = row_index + col * db_side_len;
-                assert_eq!(recovered_row.get_unchecked(col), database.get(index).unwrap(),
-                    "Small DB: Mismatch at row {}, col {}", row_index, col);
-            }
-        }
+            result
+        };
+        
+        // Test system
+        let params = gen_params(matrix_height, 2048, 17);
+        let (hint, a) = gen_hint(&params, &d);
+        let (s, query) = generate_query(&params, &v, &a);
+        let answer = process_query(&d, &query, params.q);
+        let result = recover(&hint, &s, &answer, &params);
+        
+        // Compare results
+        assert_eq!(expected, result, "Test failed: Results don't match");
+        println!("Success: Test passed!");
     }
 }
