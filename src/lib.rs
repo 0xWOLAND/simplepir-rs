@@ -217,4 +217,45 @@ mod tests {
         assert_eq!(expected, result, "Test failed: Results don't match");
         println!("Success: Test passed!");
     }
+
+    #[test]
+    fn test_pir_row_retrieval() {
+        let matrix_height = 10;
+        let matrix_width = 10;
+        let max_val = (1u64 << 17) - 1;
+        
+        // Create random test data
+        let mut rng = rand::thread_rng();
+        let d_data: Vec<u64> = (0..matrix_height * matrix_width)
+            .map(|_| rng.gen_range(0..=max_val))
+            .collect();
+        let d = DMatrix::from_vec(matrix_height, matrix_width, d_data);
+        
+        // Create query vector (all zeros except 1 at a random position)
+        let target_row = rng.gen_range(0..matrix_width);
+        let mut v_data = vec![0u64; matrix_width];
+        v_data[target_row] = 1;
+        let v = DVector::from_vec(v_data);
+        
+        // Expected result - simply the target row from the matrix
+        let expected = {
+            let mut result = DVector::zeros(matrix_height);
+            for i in 0..matrix_height {
+                result[i] = d[(i, target_row)];
+            }
+            result
+        };
+        
+        // Test system
+        let params = gen_params(matrix_height, 2048, 17);
+        let (hint, a) = gen_hint(&params, &d);
+        let (s, query) = generate_query(&params, &v, &a);
+        let answer = process_query(&d, &query, params.q);
+        let result = recover(&hint, &s, &answer, &params);
+        
+        // Compare results
+        assert_eq!(expected, result, 
+            "Test failed: Results don't match for target row {}", target_row);
+        println!("Success: Row retrieval test passed! Retrieved row {}", target_row);
+    }
 }
