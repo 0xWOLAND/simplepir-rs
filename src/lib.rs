@@ -5,10 +5,10 @@ use rand_distr::{Distribution, Normal};
 
 #[derive(Debug, Clone)]
 pub struct SimplePIRParams {
-    n: usize,       // LWE dimension
-    m: usize,       // Matrix dimension
-    q: u64,         // LWE modulus
-    p: u64,         // Plaintext modulus
+    pub n: usize,       // LWE dimension
+    pub m: usize,       // Matrix dimension
+    pub q: u64,         // LWE modulus
+    pub p: u64,         // Plaintext modulus
     std_dev: f64,   // Standard deviation for error
     seed: u64,      // Random seed for reproducibility
 }
