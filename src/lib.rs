@@ -147,12 +147,8 @@ pub fn recover(hint: &DMatrix<BigInt>, s: &DVector<BigInt>, answer: &DVector<Big
     // Compute decrypted = answer - hint*s mod q
     let mut decrypted = DVector::zeros(answer.len());
     for i in 0..answer.len() {
-        let diff = if answer[i] >= hint_s[i] {
-            &answer[i] - &hint_s[i]
-        } else {
-            params.q - (&hint_s[i] - &answer[i])
-        };
-        decrypted[i] = diff % modulus;
+        let diff = (&answer[i] + modulus - &hint_s[i]) % modulus;
+        decrypted[i] = diff;
     }
     
     // Round to nearest multiple of delta and scale down
@@ -174,7 +170,6 @@ mod tests {
         for i in 0..v1.len() {
             let diff = (&v1[i] - &v2[i]).abs();
             if diff > *tolerance {
-                println!("Difference at index {}: {}", i, diff);
                 return false;
             }
         }
