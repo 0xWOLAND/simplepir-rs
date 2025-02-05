@@ -22,7 +22,7 @@ pub fn gen_params(m: usize, n: usize, mod_power: u32) -> SimplePIRParams {
         m,
         q: 64,
         p: BigInt::one() << mod_power,
-        std_dev: 3.0,
+        std_dev: 1.2,
         seed: rng.gen(),
     }
 }
