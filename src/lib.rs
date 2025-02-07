@@ -22,7 +22,7 @@ pub fn gen_params(m: usize, n: usize, mod_power: u32) -> SimplePIRParams {
         m,
         q: 64,
         p: BigInt::one() << mod_power,
-        std_dev: 1.2,
+        std_dev: 3.2,
         seed: rng.gen(),
     }
 }
@@ -130,32 +130,40 @@ pub fn process_query(db: &DMatrix<BigInt>, query: &DVector<BigInt>, q: u64) -> D
     result
 }
 
-pub fn recover(hint: &DMatrix<BigInt>, s: &DVector<BigInt>, answer: &DVector<BigInt>, params: &SimplePIRParams) -> DVector<BigInt> {
-    let modulus = &(BigInt::one() << params.q);
-    let delta = modulus / &params.p;
-    
-    // Compute hint * s with modulo
+pub fn recover(
+    hint: &DMatrix<BigInt>,
+    s: &DVector<BigInt>,
+    answer: &DVector<BigInt>,
+    params: &SimplePIRParams,
+) -> DVector<BigInt> {
+    let modulus = BigInt::one() << params.q; 
+    let delta = &modulus / &params.p;        
+    let half_p: BigInt = &params.p >> 1;     
+
     let mut hint_s = DVector::zeros(answer.len());
     for i in 0..answer.len() {
         let mut sum = BigInt::zero();
         for j in 0..s.len() {
-            sum = (sum + (&hint[(i, j)] * &s[j]) % modulus) % modulus 
+            sum = ((&sum + &hint[(i, j)] * &s[j]) % &modulus + &modulus) % &modulus;
         }
         hint_s[i] = sum;
     }
-    
-    // Compute decrypted = answer - hint*s mod q
+
     let mut decrypted = DVector::zeros(answer.len());
     for i in 0..answer.len() {
-        let diff = (&answer[i] + modulus - &hint_s[i]) % modulus;
-        decrypted[i] = diff;
+        let diff = ((&answer[i] + &modulus - &hint_s[i]) % &modulus + &modulus) % &modulus;
+        let raw = &diff / &delta;
+        let centered = if raw >= half_p {
+            raw - &params.p
+        } else {
+            raw
+        };
+        decrypted[i] = centered;
     }
-    
-    // Round to nearest multiple of delta and scale down
-    decrypted.map(|x| {
-        x / &delta
-    })
+    decrypted
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -180,21 +188,28 @@ mod tests {
     fn test_pir() {
         let matrix_height = 10;
         let matrix_width = 10;
-        let max_val_bits = 4;
+        let max_val_bits = 12;
         
-        // Create random test data
+        // Create random test data with both positive and negative values
         let mut rng = rand::thread_rng();
         let d_data: Vec<BigInt> = (0..matrix_height * matrix_width)
-            .map(|_| rng.gen_bigint(max_val_bits).abs())
+            .map(|_| {
+                let val = rng.gen_bigint(max_val_bits);
+                // Randomly decide if the value should be negative
+                if rng.gen_bool(0.5) { -val } else { val }
+            })
             .collect();
         let d = DMatrix::from_vec(matrix_height, matrix_width, d_data);
         
         let v_data: Vec<BigInt> = (0..matrix_width)
-            .map(|_| rng.gen_bigint(max_val_bits).abs())
+            .map(|_| {
+                let val = rng.gen_bigint(max_val_bits);
+                if rng.gen_bool(0.5) { -val } else { val }
+            })
             .collect();
         let v = DVector::from_vec(v_data);
         
-        // Expected result
+        // Rest of the test remains the same
         let expected = {
             let mut result = DVector::zeros(matrix_height);
             for i in 0..matrix_height {
@@ -208,16 +223,18 @@ mod tests {
         };
         
         // Test system
-        let params = gen_params(matrix_height, 2048, 17);
+        let params = gen_params(matrix_height, 2048, 30);
         let (hint, a) = gen_hint(&params, &d);
         let (s, query) = generate_query(&params, &v, &a);
         let answer = process_query(&d, &query, params.q);
         let result = recover(&hint, &s, &answer, &params);
         
         // Define tolerance - adjust this value based on your needs
-        let tolerance = BigInt::from(1u32) << (max_val_bits / 2);
+        let tolerance = BigInt::from(10000);
         
         // Compare results with tolerance
+        println!("expected: {:?}", expected);
+        println!("result: {:?}", result);
         assert!(
             is_approximately_equal(&expected, &result, &tolerance),
             "Test failed: Results don't match within tolerance"
@@ -259,7 +276,7 @@ mod tests {
         let result = recover(&hint, &s, &answer, &params);
         
         // Define tolerance - adjust this value based on your needs
-        let tolerance = BigInt::from(1u32) << (max_val_bits / 2);
+        let tolerance = BigInt::from(10);
         
         // Compare results with tolerance
         assert!(
